@@ -105,6 +105,7 @@ function toGame(sx, sy) {
 }
 
 // ---- Game State ----
+let gameStarted = false; // gates spawning until first user interaction
 const gnats = [];
 let totalSpawned = 0;              // how many flies have been created total
 let fliesRemaining = TOTAL_FLIES;  // decremented ONLY on successful hits
@@ -118,15 +119,87 @@ counterEl.textContent = String(fliesRemaining);
 const AudioMode = { MP3: 'mp3', SYNTH: 'synth' };
 let audioMode = AudioMode.SYNTH;
 
-// MP3 backend (kept for later)
+// ---------- Background Music System (level-aware) ----------
+// Designed to support multiple tracks per level
+const MUSIC_TRACKS = {
+  level1: 'https://raw.githubusercontent.com/wegoincam/FlySwatterv2/main/GnatAttackR1.mp3'
+  // level2: '...',
+  // boss: '...'
+};
+
+let currentMusicKey = null;
+let musicBuffer = null;
+let musicSource = null;
+let musicGain = null;
+let musicStarted = false;
+
+// MP3 backend (kept for SFX compatibility)
 const swatSound = new Audio('https://dl.dropboxusercontent.com/u/1256960/GnatAttack/swing.mp3');
 const killSound = new Audio('https://dl.dropboxusercontent.com/u/1256960/GnatAttack/bugDie.mp3');
 swatSound.preload = 'auto';
 killSound.preload = 'auto';
 
-// Synth backend
+// Synth backend + music decoding
 const AudioCtx = window.AudioContext || window.webkitAudioContext;
 const audioCtx = new AudioCtx();
+
+async function loadMusic(key) {
+  if (!MUSIC_TRACKS[key]) return;
+  if (currentMusicKey === key && musicBuffer) return;
+
+  stopMusic();
+
+  const res = await fetch(MUSIC_TRACKS[key]);
+  if (!res.ok) throw new Error('Failed to fetch music: ' + res.status);
+  const arrayBuf = await res.arrayBuffer();
+  musicBuffer = await audioCtx.decodeAudioData(arrayBuf);
+  currentMusicKey = key;
+}
+
+function playMusic(loop = true) {
+  if (!musicBuffer) return;
+
+  // Defensive: stop any existing source
+  if (musicSource) {
+    try { musicSource.stop(); } catch (_) {}
+    try { musicSource.disconnect(); } catch (_) {}
+    musicSource = null;
+  }
+
+  musicSource = audioCtx.createBufferSource();
+  musicSource.buffer = musicBuffer;
+  musicSource.loop = loop;
+
+  musicGain = audioCtx.createGain();
+  musicGain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  musicGain.gain.exponentialRampToValueAtTime(0.35, audioCtx.currentTime + 1.2);
+
+  musicSource.connect(musicGain).connect(audioCtx.destination);
+  musicSource.start();
+}
+
+function stopMusic() {
+  if (musicSource) {
+    try { musicSource.stop(); } catch (_) {}
+    try { musicSource.disconnect(); } catch (_) {}
+    musicSource = null;
+  }
+  musicBuffer = null;
+  currentMusicKey = null;
+}
+// -----------------------------------------------------------
+
+function ensureMusicStarted() {
+  if (musicStarted) return;
+  musicStarted = true;
+
+  loadMusic('level1')
+    .then(() => playMusic(true))
+    .catch(err => {
+      console.warn('Music failed to start:', err);
+      musicStarted = false; // allow retry
+    });
+}
 
 function playSynthWoosh() {
   // Open-air swing woosh: soft broadband noise + gentle bandpass sweep
@@ -229,51 +302,25 @@ const SWATTER_SRC_H = 120;
 // Cursor anchor: (24,96) from bottom-left -> (24,24) from top-left
 const SWATTER_ANCHOR = { x: 24, y: 24 };
 
-// Collision zones (game units, relative to anchor)
-// Top 50px = hitbox, Bottom 50px = hurtbox
+// ===== COLLISION GEOMETRY LOCKED =====
+// These values were tuned visually and should not be changed casually.
+// If you touch these, re-enable debug and recalibrate deliberately.
 
-// Base hit radius slightly expanded (~+2%)
-// Base hit radius slightly expanded (~+2%)
 // LOCKED: Swatter hit radius (+2% forgiveness, tuned)
 const SWATTER_HIT_RADIUS = 18 * 1.04;
 
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Previously ~1/3 of the hitbox was above the sprite, so we shift it down by radius / 3.
-// NOTE: This offset is in GAME units; the on-screen debug circle accounts for scaling.
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Visual testing showed ~1/3 of the DIAMETER was above the sprite, not 1/3 of the radius.
-// Shift down by one full radius in GAME units.
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Shifted down by one full radius, plus an additional 6 game units for fine tuning.
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Shifted down by one full radius, plus an additional 12 game units for fine tuning.
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Shifted down by one full radius, plus an additional 16 game units for fine tuning.
-// Hitbox center offset (lowered so the circle sits fully over the swatter head)
-// Shifted down by one full radius, plus an additional 18 game units for fine tuning.
 // LOCKED: Swatter hitbox center offset (final tuned position)
 const SWATTER_HIT_OFFSET = { x: 0, y: -36 + SWATTER_HIT_RADIUS + 18 };
 
-// Hand hurtbox center offset (moved further down into the hand)
-// Lowered by an additional 72 game units for correct alignment
-// Hand hurtbox center offset (moved further down into the hand)
-// Lowered by an additional 144 game units total for correct alignment
-// Hand hurtbox center offset (moved further down into the hand)
-// Lowered by an additional 108 game units total for correct alignment
-// Hand hurtbox center offset (moved further down into the hand)
-// Fine-tuned: moved 2 units down and 4 units to the right
 // LOCKED: Hand hurtbox center offset (final tuned position)
 const HAND_HURT_OFFSET = { x: 4, y: 36 + 110 };
-// Hand hurtbox radius slightly reduced (~98%) for finer contact feel
+
 // LOCKED: Hand hurtbox radius (98% size, tuned)
 const HAND_HURT_RADIUS = 16 * 0.98; // reserved for boss later
 
 // Debug
-// ===== COLLISION GEOMETRY LOCKED =====
-// These values were tuned visually and should not be changed casually.
-// If you touch these, re-enable debug and recalibrate deliberately.
 const DEBUG_HITBOX = false;
-const DEBUG_HURTBOX = false; // debug hand hurtbox // debug hand hurtbox
+const DEBUG_HURTBOX = false;
 
 // Swatter animation states
 const SwatterState = { IDLE: 'idle', SWING: 'swing', HIT: 'hit' };
@@ -311,17 +358,24 @@ function onKill() {
 }
 
 function swat() {
+  // First interaction starts the game loop (spawning + music)
+  if (!gameStarted) {
+    gameStarted = true;
+  }
   // Ignore clicks mid-animation (option B)
   if (swatterState !== SwatterState.IDLE) return;
 
   // Many browsers require a user gesture before audio will play.
-  // A click counts as a gesture, so try to resume.
   if (audioCtx && audioCtx.state === 'suspended') {
     audioCtx.resume().catch(() => {});
   }
 
+  // Start background music on first valid user interaction
+  ensureMusicStarted();
+
   playSwatSound();
 
+  // Always show transition + contact states on click
   swatterState = SwatterState.SWING;
   swatterTimer = SWING_TIME;
 
@@ -343,9 +397,7 @@ function swat() {
     const dy = g.y - hitY;
     const d2 = dx * dx + dy * dy;
 
-    if (d2 <= r2) {
-      hits.push(g);
-    }
+    if (d2 <= r2) hits.push(g);
   }
 
   if (hits.length > 0) {
@@ -468,6 +520,9 @@ class Gnat {
 let lastTime = performance.now();
 
 function update(dt) {
+  // Do not spawn or update enemies until the game has started
+  if (!gameStarted) return;
+
   // If the level count is 0, do nothing (boss later)
   if (fliesRemaining <= 0) {
     gnats.length = 0;
@@ -504,21 +559,55 @@ function update(dt) {
   }
 }
 
-function render() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+function drawBackgroundGrid() {
+  const TILE = 48;
+  const BORDER = 2;
+
+  const cols = Math.ceil(canvas.width / TILE);
+  const rows = Math.ceil(canvas.height / TILE);
+
+  ctx.save();
+  ctx.fillStyle = '#efefef';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const px = x * TILE;
+      const py = y * TILE;
+
+      ctx.fillStyle = '#e3e3e3';
+      ctx.fillRect(px, py, TILE, TILE);
+
+      ctx.strokeStyle = '#d0d0d0';
+      ctx.lineWidth = BORDER;
+      ctx.strokeRect(
+        px + BORDER / 2,
+        py + BORDER / 2,
+        TILE - BORDER,
+        TILE - BORDER
+      );
+    }
+  }
+
+  ctx.restore();
+}
+
+function render(dt) {
+  // Draw dynamic tiled background FIRST
+  drawBackgroundGrid();
 
   // Draw enemies
   gnats.forEach(g => g.draw());
 
-  // Advance swatter animation state
+  // Advance swatter animation state (dt-based)
   if (swatterState === SwatterState.SWING) {
-    swatterTimer -= 1 / 60;
+    swatterTimer -= dt;
     if (swatterTimer <= 0) {
       swatterState = SwatterState.HIT;
       swatterTimer = HIT_TIME;
     }
   } else if (swatterState === SwatterState.HIT) {
-    swatterTimer -= 1 / 60;
+    swatterTimer -= dt;
     if (swatterTimer <= 0) {
       swatterState = SwatterState.IDLE;
     }
@@ -592,7 +681,7 @@ function loop(now) {
   const dt = Math.min(0.033, (now - lastTime) / 1000);
   lastTime = now;
   update(dt);
-  render();
+  render(dt);
   requestAnimationFrame(loop);
 }
 
@@ -607,6 +696,10 @@ function loop(now) {
   console.assert(swatSound instanceof HTMLAudioElement, 'swatSound is audio');
   console.assert(killSound instanceof HTMLAudioElement, 'killSound is audio');
   console.assert(audioCtx && typeof audioCtx.createOscillator === 'function', 'audioCtx exists');
+  console.assert(typeof loadMusic === 'function', 'loadMusic exists');
+  console.assert(typeof playMusic === 'function', 'playMusic exists');
+  console.assert(typeof stopMusic === 'function', 'stopMusic exists');
+  console.assert(typeof ensureMusicStarted === 'function', 'ensureMusicStarted exists');
 })();
 
 (function coreTests() {
@@ -628,11 +721,6 @@ function loop(now) {
   console.assert(SWATTER_ANCHOR.x === 24 && SWATTER_ANCHOR.y === 24, 'swatter anchor (24,24)');
   console.assert(SWATTER_HIT_RADIUS > 0, 'hit radius positive');
   console.assert(HAND_HURT_RADIUS > 0, 'hurt radius positive');
-
-  // Ensure we don't reference uninitialized constants (regression test)
-  console.assert(typeof SWATTER_HIT_OFFSET === 'object' && SWATTER_HIT_OFFSET !== null, 'hit offset exists');
-  console.assert(Number.isFinite(SWATTER_HIT_OFFSET.y), 'hit offset y is finite');
-  console.assert(SWATTER_HIT_OFFSET.y > -100 && SWATTER_HIT_OFFSET.y < 100, 'hit offset y sane range');
 
   // Spawn totals should never exceed TOTAL_FLIES
   console.assert(totalSpawned <= TOTAL_FLIES, 'totalSpawned never exceeds TOTAL_FLIES at init');
