@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gnat Attack v3 (Refactored Core)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #e9e9e9;
+      cursor: none;
+      user-select: none;
+    }
+    canvas { display: block; }
+    #counter {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: system-ui, sans-serif;
+      font-size: 48px;
+      font-weight: 800;
+      color: white;
+      text-shadow: 2px 2px 0 #000;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="counter">100</div>
+
+<script>
+// =========================
+// Gnat Attack v3 – Core Refactor (dt-based, de-SNES-ified)
+// =========================
+
+// ---- Constants ----
+const PLAYFIELD = { width: 800, height: 600, margin: 48 };
+
+// Visual scaling
+const SIZE_SCALE = 3;         // global sprite scale (flies, etc.)
+const SWATTER_SCALE = 0.7;    // swatter-only scale (70%)
+
+// Exactly 100 flies exist in the level (no extras)
+const TOTAL_FLIES = 100;
+
+// Spawn constraints
+const MAX_ONSCREEN = 8;
+const MAX_PER_SPAWN = 2; // max concurrently "in pipeline" spawns (NOT simultaneous spawns)
+
+// Spawn timing (each fly has its own delay)
+const SPAWN_DELAY_RANGE = [0.9, 1.8];      // natural per-fly delay
+const POST_KILL_DELAY_RANGE = [0.6, 1.4];  // enforced delay after a kill (applies to next fly)
+
+const EnemyState = {
+  SPAWNING: 0,
+  ENTERING: 1,
+  ACTIVE: 2,
+  DYING: 3
+};
+
+// ---- Utilities ----
+const rand = (min, max) => Math.random() * (max - min) + min;
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const len2 = (x, y) => x * x + y * y;
+const length = (x, y) => Math.sqrt(len2(x, y));
+const normalize = (x, y) => {
+  const l = length(x, y) || 1;
+  return { x: x / l, y: y / l };
+};
+const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+// ---- Canvas Setup ----
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---- Coordinate Mapping ----
+function getTransform() {
+  const scale = Math.min(canvas.width / PLAYFIELD.width, canvas.height / PLAYFIELD.height);
+  const ox = (canvas.width - PLAYFIELD.width * scale) / 2;
+  const oy = (canvas.height - PLAYFIELD.height * scale) / 2;
+  return { scale, ox, oy };
+}
+
+function toScreen(x, y) {
+  const { scale, ox, oy } = getTransform();
+  return { x: ox + x * scale, y: oy + y * scale, scale };
+}
+
+function toGame(sx, sy) {
+  const { scale, ox, oy } = getTransform();
+  return { x: (sx - ox) / scale, y: (sy - oy) / scale };
+}
+
+// ---- Game State ----
+let gameStarted = false; // gates spawning until first user interaction
+const gnats = [];
+let totalSpawned = 0;              // how many flies have been created total
+let fliesRemaining = TOTAL_FLIES;  // decremented ONLY on successful hits
+let spawnQueue = 0;                // how many flies are waiting to spawn (max MAX_PER_SPAWN)
+let spawnTimer = rand(0.6, 1.4);   // timer for next individual spawn
+
+const counterEl = document.getElementById('counter');
+counterEl.textContent = String(fliesRemaining);
+
+// ---- Audio ----
+const AudioMode = { MP3: 'mp3', SYNTH: 'synth' };
+let audioMode = AudioMode.SYNTH;
+
+// ---------- Background Music System (level-aware) ----------
+// Designed to support multiple tracks per level
+const MUSIC_TRACKS = {
+  level1: 'https://raw.githubusercontent.com/wegoincam/FlySwatterv2/main/GnatAttackR1.mp3'
+  // level2: '...',
+  // boss: '...'
+};
+
+let currentMusicKey = null;
+let musicBuffer = null;
+let musicSource = null;
+let musicGain = null;
+let musicStarted = false;
+
+// MP3 backend (kept for SFX compatibility)
+const swatSound = new Audio('https://dl.dropboxusercontent.com/u/1256960/GnatAttack/swing.mp3');
+const killSound = new Audio('https://dl.dropboxusercontent.com/u/1256960/GnatAttack/bugDie.mp3');
+swatSound.preload = 'auto';
+killSound.preload = 'auto';
+
+// Synth backend + music decoding
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+const audioCtx = new AudioCtx();
+
+async function loadMusic(key) {
+  if (!MUSIC_TRACKS[key]) return;
+  if (currentMusicKey === key && musicBuffer) return;
+
+  stopMusic();
+
+  const res = await fetch(MUSIC_TRACKS[key]);
+  if (!res.ok) throw new Error('Failed to fetch music: ' + res.status);
+  const arrayBuf = await res.arrayBuffer();
+  musicBuffer = await audioCtx.decodeAudioData(arrayBuf);
+  currentMusicKey = key;
+}
+
+function playMusic(loop = true) {
+  if (!musicBuffer) return;
+
+  // Defensive: stop any existing source
+  if (musicSource) {
+    try { musicSource.stop(); } catch (_) {}
+    try { musicSource.disconnect(); } catch (_) {}
+    musicSource = null;
+  }
+
+  musicSource = audioCtx.createBufferSource();
+  musicSource.buffer = musicBuffer;
+  musicSource.loop = loop;
+
+  musicGain = audioCtx.createGain();
+  musicGain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  musicGain.gain.exponentialRampToValueAtTime(0.35, audioCtx.currentTime + 1.2);
+
+  musicSource.connect(musicGain).connect(audioCtx.destination);
+  musicSource.start();
+}
+
+function stopMusic() {
+  if (musicSource) {
+    try { musicSource.stop(); } catch (_) {}
+    try { musicSource.disconnect(); } catch (_) {}
+    musicSource = null;
+  }
+  musicBuffer = null;
+  currentMusicKey = null;
+}
+// -----------------------------------------------------------
+
+function ensureMusicStarted() {
+  if (musicStarted) return;
+  musicStarted = true;
+
+  loadMusic('level1')
+    .then(() => playMusic(true))
+    .catch(err => {
+      console.warn('Music failed to start:', err);
+      musicStarted = false; // allow retry
+    });
+}
+
+function playSynthWoosh() {
+  // Open-air swing woosh: soft broadband noise + gentle bandpass sweep
+  const duration = 0.18;
+
+  const buffer = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * duration), audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * 0.25;
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.setValueAtTime(900, audioCtx.currentTime);
+  filter.frequency.exponentialRampToValueAtTime(420, audioCtx.currentTime + duration);
+  filter.Q.value = 0.6;
+
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.28, audioCtx.currentTime + 0.04);
+  gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+
+  src.connect(filter).connect(gain).connect(audioCtx.destination);
+  src.start();
+  src.stop(audioCtx.currentTime + duration);
+}
+
+function playSynthKill() {
+  // Goofier, wetter "burp" splat
+  const t = audioCtx.currentTime;
+
+  const osc = audioCtx.createOscillator();
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(170, t);
+  osc.frequency.exponentialRampToValueAtTime(85, t + 0.18);
+
+  const lfo = audioCtx.createOscillator();
+  const lfoGain = audioCtx.createGain();
+  lfo.frequency.value = 14;
+  lfoGain.gain.value = 22;
+  lfo.connect(lfoGain).connect(osc.frequency);
+
+  const noiseDur = 0.22;
+  const noiseBuffer = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * noiseDur), audioCtx.sampleRate);
+  const nd = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = (Math.random() * 2 - 1) * 0.35;
+
+  const noise = audioCtx.createBufferSource();
+  noise.buffer = noiseBuffer;
+
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.setValueAtTime(480, t);
+  filter.frequency.exponentialRampToValueAtTime(360, t + 0.22);
+  filter.Q.value = 6.5;
+
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(0.42, t + 0.025);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+
+  osc.connect(filter);
+  noise.connect(filter);
+  filter.connect(gain).connect(audioCtx.destination);
+
+  lfo.start(t);
+  osc.start(t);
+  noise.start(t);
+
+  lfo.stop(t + 0.2);
+  osc.stop(t + 0.3);
+  noise.stop(t + 0.3);
+}
+
+function playSwatSound() {
+  if (audioMode === AudioMode.MP3) {
+    try { swatSound.currentTime = 0; swatSound.play(); } catch (_) {}
+  } else {
+    playSynthWoosh();
+  }
+}
+
+function playKillSound() {
+  if (audioMode === AudioMode.MP3) {
+    try { killSound.currentTime = 0; killSound.play(); } catch (_) {}
+  } else {
+    playSynthKill();
+  }
+}
+
+// ---- Input / Hand + Fly Swatter (image-based, state machine) ----
+let mouseX = canvas.width / 2;
+let mouseY = canvas.height / 2;
+
+// Sprite source dimensions
+const SWATTER_SRC_W = 48;
+const SWATTER_SRC_H = 120;
+
+// Cursor anchor: (24,96) from bottom-left -> (24,24) from top-left
+const SWATTER_ANCHOR = { x: 24, y: 24 };
+
+// ===== COLLISION GEOMETRY LOCKED =====
+// These values were tuned visually and should not be changed casually.
+// If you touch these, re-enable debug and recalibrate deliberately.
+
+// LOCKED: Swatter hit radius (+2% forgiveness, tuned)
+const SWATTER_HIT_RADIUS = 18 * 1.04;
+
+// LOCKED: Swatter hitbox center offset (final tuned position)
+const SWATTER_HIT_OFFSET = { x: 0, y: -36 + SWATTER_HIT_RADIUS + 18 };
+
+// LOCKED: Hand hurtbox center offset (final tuned position)
+const HAND_HURT_OFFSET = { x: 4, y: 36 + 110 };
+
+// LOCKED: Hand hurtbox radius (98% size, tuned)
+const HAND_HURT_RADIUS = 16 * 0.98; // reserved for boss later
+
+// Debug
+const DEBUG_HITBOX = false;
+const DEBUG_HURTBOX = false;
+
+// Swatter animation states
+const SwatterState = { IDLE: 'idle', SWING: 'swing', HIT: 'hit' };
+let swatterState = SwatterState.IDLE;
+let swatterTimer = 0;
+
+// Timing (very fast, Mario Paint feel)
+const SWING_TIME = 0.06;
+const HIT_TIME = 0.08;
+
+// Load sprites
+const swatterImg = {
+  idle: new Image(),
+  swing: new Image(),
+  hit: new Image()
+};
+
+swatterImg.idle.src = 'https://i.imgur.com/WNpbutn.png';
+swatterImg.swing.src = 'https://i.imgur.com/tKIwIH5.png';
+swatterImg.hit.src = 'https://i.imgur.com/L5ApWsN.png';
+
+window.addEventListener('mousemove', e => {
+  mouseX = e.clientX;
+  mouseY = e.clientY;
+});
+
+function onKill() {
+  // enforce a post-kill delay before the next fly spawns
+  spawnTimer = rand(POST_KILL_DELAY_RANGE[0], POST_KILL_DELAY_RANGE[1]);
+
+  if (fliesRemaining <= 0) {
+    gnats.length = 0;
+    spawnQueue = 0;
+  }
+}
+
+function swat() {
+  // First interaction starts the game loop (spawning + music)
+  if (!gameStarted) {
+    gameStarted = true;
+  }
+  // Ignore clicks mid-animation (option B)
+  if (swatterState !== SwatterState.IDLE) return;
+
+  // Many browsers require a user gesture before audio will play.
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+
+  // Start background music on first valid user interaction
+  ensureMusicStarted();
+
+  playSwatSound();
+
+  // Always show transition + contact states on click
+  swatterState = SwatterState.SWING;
+  swatterTimer = SWING_TIME;
+
+  if (fliesRemaining <= 0) return;
+
+  const gp = toGame(mouseX, mouseY);
+  const hitX = gp.x + SWATTER_HIT_OFFSET.x;
+  const hitY = gp.y + SWATTER_HIT_OFFSET.y;
+  const r2 = (SWATTER_HIT_RADIUS * SIZE_SCALE) ** 2;
+
+  // Collect ALL gnats under the hitbox
+  const hits = [];
+
+  for (let i = 0; i < gnats.length; i++) {
+    const g = gnats[i];
+    if (g.state !== EnemyState.ACTIVE && g.state !== EnemyState.ENTERING) continue;
+
+    const dx = g.x - hitX;
+    const dy = g.y - hitY;
+    const d2 = dx * dx + dy * dy;
+
+    if (d2 <= r2) hits.push(g);
+  }
+
+  if (hits.length > 0) {
+    hits.forEach(g => {
+      if (g.state === EnemyState.ACTIVE || g.state === EnemyState.ENTERING) {
+        g.state = EnemyState.DYING;
+        fliesRemaining--;
+      }
+    });
+
+    counterEl.textContent = String(fliesRemaining);
+    playKillSound();
+    onKill();
+  }
+}
+
+window.addEventListener('mousedown', swat);
+window.addEventListener('touchstart', e => {
+  const t = e.touches && e.touches[0];
+  if (!t) return;
+  mouseX = t.clientX;
+  mouseY = t.clientY;
+  swat();
+}, { passive: true });
+
+// ---- Enemy ----
+class Gnat {
+  constructor() {
+    const side = Math.floor(Math.random() * 4);
+    if (side === 0) { this.x = rand(0, PLAYFIELD.width); this.y = -20; }
+    if (side === 1) { this.x = PLAYFIELD.width + 20; this.y = rand(0, PLAYFIELD.height); }
+    if (side === 2) { this.x = rand(0, PLAYFIELD.width); this.y = PLAYFIELD.height + 20; }
+    if (side === 3) { this.x = -20; this.y = rand(0, PLAYFIELD.height); }
+
+    this.entryX = rand(PLAYFIELD.margin, PLAYFIELD.width - PLAYFIELD.margin);
+    this.entryY = rand(PLAYFIELD.margin, PLAYFIELD.height - PLAYFIELD.margin);
+
+    const dir = normalize(this.entryX - this.x, this.entryY - this.y);
+    this.speed = rand(90, 130);
+    this.vx = dir.x * this.speed;
+    this.vy = dir.y * this.speed;
+    this.angle = Math.atan2(this.vy, this.vx);
+
+    this.maxTurnRate = rand(Math.PI * 0.6, Math.PI * 1.2);
+    this.wanderAngle = rand(-Math.PI, Math.PI);
+    this.wanderJitter = rand(0.5, 1.2);
+
+    this.flap = rand(0, Math.PI * 2);
+    this.flapRate = rand(18, 26);
+
+    this.state = EnemyState.ENTERING;
+  }
+
+  update(dt) {
+    if (this.state === EnemyState.DYING) return;
+
+    if (this.state === EnemyState.ENTERING) {
+      const dx = this.entryX - this.x;
+      const dy = this.entryY - this.y;
+      if (dx * dx + dy * dy < 14 * 14) this.state = EnemyState.ACTIVE;
+    }
+
+    if (this.state === EnemyState.ACTIVE) {
+      this.wanderAngle += rand(-1, 1) * this.wanderJitter * dt;
+    }
+
+    let desiredAngle = this.angle + this.wanderAngle * 0.15;
+
+    const m = PLAYFIELD.margin;
+    if (this.x < m) desiredAngle = 0;
+    if (this.x > PLAYFIELD.width - m) desiredAngle = Math.PI;
+    if (this.y < m) desiredAngle = Math.PI / 2;
+    if (this.y > PLAYFIELD.height - m) desiredAngle = -Math.PI / 2;
+
+    let delta = wrapAngle(desiredAngle - this.angle);
+    delta = clamp(delta, -this.maxTurnRate * dt, this.maxTurnRate * dt);
+    this.angle = wrapAngle(this.angle + delta);
+
+    this.vx = Math.cos(this.angle) * this.speed;
+    this.vy = Math.sin(this.angle) * this.speed;
+
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+
+    this.x = clamp(this.x, 0, PLAYFIELD.width);
+    this.y = clamp(this.y, 0, PLAYFIELD.height);
+
+    this.flap += this.flapRate * dt;
+  }
+
+  draw() {
+    const s = toScreen(this.x, this.y);
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.scale(s.scale * SIZE_SCALE, s.scale * SIZE_SCALE);
+    ctx.rotate(this.angle + Math.PI / 2);
+
+    const wingPulse = 0.85 + 0.2 * Math.sin(this.flap);
+
+    // Wings
+    ctx.globalAlpha = 0.8;
+    ctx.fillStyle = '#cfcfcf';
+    ctx.beginPath();
+    ctx.ellipse(-3.2, -1.1, 4.2 * wingPulse, 6.2, -0.65, 0, Math.PI * 2);
+    ctx.ellipse( 3.2, -1.1, 4.2 * wingPulse, 6.2,  0.65, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Body
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#5a5a5a';
+    ctx.beginPath();
+    ctx.ellipse(0, 0.6, 2.1, 3.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+// ---- Loop ----
+let lastTime = performance.now();
+
+function update(dt) {
+  // Do not spawn or update enemies until the game has started
+  if (!gameStarted) return;
+
+  // If the level count is 0, do nothing (boss later)
+  if (fliesRemaining <= 0) {
+    gnats.length = 0;
+    spawnQueue = 0;
+    return;
+  }
+
+  spawnTimer -= dt;
+
+  // Queue logic:
+  // Maintain up to MAX_PER_SPAWN pending spawns, but never exceed TOTAL_FLIES overall
+  if (
+    spawnQueue < MAX_PER_SPAWN &&
+    totalSpawned + spawnQueue < TOTAL_FLIES &&
+    gnats.length + spawnQueue < MAX_ONSCREEN
+  ) {
+    spawnQueue++;
+  }
+
+  // Spawn ONE fly when its personal timer elapses
+  if (spawnQueue > 0 && spawnTimer <= 0) {
+    gnats.push(new Gnat());
+    totalSpawned++;
+    spawnQueue--;
+
+    // Each fly gets its OWN delay
+    spawnTimer = rand(SPAWN_DELAY_RANGE[0], SPAWN_DELAY_RANGE[1]);
+  }
+
+  for (let i = gnats.length - 1; i >= 0; i--) {
+    const g = gnats[i];
+    g.update(dt);
+    if (g.state === EnemyState.DYING) gnats.splice(i, 1);
+  }
+}
+
+function drawBackgroundGrid() {
+  const TILE = 48;
+  const BORDER = 2;
+
+  const cols = Math.ceil(canvas.width / TILE);
+  const rows = Math.ceil(canvas.height / TILE);
+
+  ctx.save();
+  ctx.fillStyle = '#efefef';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const px = x * TILE;
+      const py = y * TILE;
+
+      ctx.fillStyle = '#e3e3e3';
+      ctx.fillRect(px, py, TILE, TILE);
+
+      ctx.strokeStyle = '#d0d0d0';
+      ctx.lineWidth = BORDER;
+      ctx.strokeRect(
+        px + BORDER / 2,
+        py + BORDER / 2,
+        TILE - BORDER,
+        TILE - BORDER
+      );
+    }
+  }
+
+  ctx.restore();
+}
+
+function render(dt) {
+  // Draw dynamic tiled background FIRST
+  drawBackgroundGrid();
+
+  // Draw enemies
+  gnats.forEach(g => g.draw());
+
+  // Advance swatter animation state (dt-based)
+  if (swatterState === SwatterState.SWING) {
+    swatterTimer -= dt;
+    if (swatterTimer <= 0) {
+      swatterState = SwatterState.HIT;
+      swatterTimer = HIT_TIME;
+    }
+  } else if (swatterState === SwatterState.HIT) {
+    swatterTimer -= dt;
+    if (swatterTimer <= 0) {
+      swatterState = SwatterState.IDLE;
+    }
+  }
+
+  // Draw swatter sprite (idle = static, no rotation)
+  const gp = toGame(mouseX, mouseY);
+  const sp = toScreen(gp.x, gp.y);
+  const img = swatterImg[swatterState];
+
+  if (img && img.complete) {
+    const scale = sp.scale * SIZE_SCALE * SWATTER_SCALE;
+    const drawX = sp.x - SWATTER_ANCHOR.x * scale;
+    const drawY = sp.y - SWATTER_ANCHOR.y * scale;
+
+    ctx.drawImage(
+      img,
+      drawX,
+      drawY,
+      SWATTER_SRC_W * scale,
+      SWATTER_SRC_H * scale
+    );
+
+    // Debug: draw hit radius
+    if (DEBUG_HITBOX) {
+      const hitScreen = toScreen(
+        gp.x + SWATTER_HIT_OFFSET.x,
+        gp.y + SWATTER_HIT_OFFSET.y
+      );
+
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255, 0, 0, 0.6)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(
+        hitScreen.x,
+        hitScreen.y,
+        SWATTER_HIT_RADIUS * SIZE_SCALE * hitScreen.scale,
+        0,
+        Math.PI * 2
+      );
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Debug: draw hand hurtbox
+    if (DEBUG_HURTBOX) {
+      const hurtScreen = toScreen(
+        gp.x + HAND_HURT_OFFSET.x,
+        gp.y + HAND_HURT_OFFSET.y
+      );
+
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0, 0, 255, 0.6)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(
+        hurtScreen.x,
+        hurtScreen.y,
+        HAND_HURT_RADIUS * SIZE_SCALE * hurtScreen.scale,
+        0,
+        Math.PI * 2
+      );
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+function loop(now) {
+  const dt = Math.min(0.033, (now - lastTime) / 1000);
+  lastTime = now;
+  update(dt);
+  render(dt);
+  requestAnimationFrame(loop);
+}
+
+// ---- Tests ----
+(function audioBackendTests() {
+  console.assert(typeof playSwatSound === 'function', 'playSwatSound exists');
+  console.assert(typeof playKillSound === 'function', 'playKillSound exists');
+  console.assert(audioMode === AudioMode.SYNTH || audioMode === AudioMode.MP3, 'audioMode valid');
+})();
+
+(function audioTests() {
+  console.assert(swatSound instanceof HTMLAudioElement, 'swatSound is audio');
+  console.assert(killSound instanceof HTMLAudioElement, 'killSound is audio');
+  console.assert(audioCtx && typeof audioCtx.createOscillator === 'function', 'audioCtx exists');
+  console.assert(typeof loadMusic === 'function', 'loadMusic exists');
+  console.assert(typeof playMusic === 'function', 'playMusic exists');
+  console.assert(typeof stopMusic === 'function', 'stopMusic exists');
+  console.assert(typeof ensureMusicStarted === 'function', 'ensureMusicStarted exists');
+})();
+
+(function coreTests() {
+  console.assert(fliesRemaining === TOTAL_FLIES, 'fliesRemaining starts at TOTAL_FLIES');
+  console.assert(TOTAL_FLIES === 100, 'total flies is exactly 100');
+  console.assert(MAX_ONSCREEN === 8, 'max onscreen 8');
+  console.assert(MAX_PER_SPAWN === 2, 'max per spawn 2');
+
+  const p = normalize(3, 4);
+  console.assert(Math.abs(length(p.x, p.y) - 1) < 1e-6, 'normalize');
+
+  const mid = toGame(canvas.width / 2, canvas.height / 2);
+  const back = toScreen(mid.x, mid.y);
+  console.assert(Math.abs(back.x - canvas.width / 2) < 2, 'toGame/toScreen X roundtrip');
+  console.assert(Math.abs(back.y - canvas.height / 2) < 2, 'toGame/toScreen Y roundtrip');
+
+  // Swatter geometry sanity checks
+  console.assert(SWATTER_SRC_W === 48 && SWATTER_SRC_H === 120, 'swatter sprite dims');
+  console.assert(SWATTER_ANCHOR.x === 24 && SWATTER_ANCHOR.y === 24, 'swatter anchor (24,24)');
+  console.assert(SWATTER_HIT_RADIUS > 0, 'hit radius positive');
+  console.assert(HAND_HURT_RADIUS > 0, 'hurt radius positive');
+
+  // Spawn totals should never exceed TOTAL_FLIES
+  console.assert(totalSpawned <= TOTAL_FLIES, 'totalSpawned never exceeds TOTAL_FLIES at init');
+
+  // Queue bounded
+  console.assert(spawnQueue >= 0 && spawnQueue <= MAX_PER_SPAWN, 'spawnQueue bounded at init');
+})();
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
